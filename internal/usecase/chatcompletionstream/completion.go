@@ -3,6 +3,7 @@ package chatcompletionstream
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 
 	"github.com/devfullcycle/fclx/chatservice/internal/domain/entity"
@@ -39,9 +40,10 @@ type ChatCompletionOutputDTO struct {
 type ChatCompletionUseCase struct {
 	ChatGateway  gateway.ChatGateway
 	OpenAiClient *openai.Client
+	Stream       chan *ChatCompletionOutputDTO
 }
 
-func NewChatCompletion(chatGateway gateway.ChatGateway, openAiClient *openai.Client) *ChatCompletionUseCase {
+func NewChatCompletionUseCase(chatGateway gateway.ChatGateway, openAiClient *openai.Client, stream chan *ChatCompletionOutputDTO) *ChatCompletionUseCase {
 	return &ChatCompletionUseCase{
 		ChatGateway:  chatGateway,
 		OpenAiClient: openAiClient,
@@ -103,7 +105,41 @@ func (uc *ChatCompletionUseCase) Execute(ctx context.Context, input ChatCompleti
 
 	for {
 		response, err := resp.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, errors.New("error receiving chat completion:" + err.Error())
+		}
+
+		fullResponse.WriteString(response.Choices[0].Delta.Content)
+		r := ChatCompletionOutputDTO{
+			ChatId:  chat.ID,
+			UserId:  chat.UserId,
+			Content: fullResponse.String(),
+		}
+
+		uc.Stream <- &r
 	}
+
+	assistant, err := entity.NewMessage("assistant", fullResponse.String(), chat.Config.Model)
+	if err != nil {
+		return nil, errors.New("error creating assistant message:" + err.Error())
+	}
+	err = chat.AddMessage(assistant)
+	if err != nil {
+		return nil, errors.New("error adding assistant message to chat:" + err.Error())
+	}
+
+	err = uc.ChatGateway.SaveChat(ctx, chat)
+	if err != nil {
+		return nil, errors.New("error saving chat:" + err.Error())
+	}
+	return &ChatCompletionOutputDTO{
+		ChatId:  chat.ID,
+		UserId:  chat.UserId,
+		Content: fullResponse.String(),
+	}, nil
 }
 
 func createNewChat(input ChatCompletionInputDTO) (*entity.Chat, error) {
